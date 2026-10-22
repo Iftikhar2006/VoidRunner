@@ -1,0 +1,30 @@
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables and secrets
+.env
+.env.*
+
+# IDE settings
+.vscode/
+.idea/
+
+# Model checkpoints
+checkpoints/*
+!checkpoints/.gitkeep
+
+# Generated results
+results/*
+!results/.gitkeep
+
+# OS files
+.DS_Store
+Thumbs.db
