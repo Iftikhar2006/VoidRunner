@@ -4,14 +4,23 @@ import numpy as np
 import pygame
 from gymnasium import spaces
 
+from environment.terrain_generator import generate_terrain
+
 
 class TerrainEnv(gym.Env):
     metadata = {"render_modes": ["human"], "render_fps": 60}
 
-    def __init__(self, render_mode=None):
+    def __init__(self, render_mode=None, difficulty="hard"):
         super().__init__()
 
+        if difficulty not in ("easy", "medium", "hard"):
+            raise ValueError(
+                "Difficulty must be 'easy', 'medium', or 'hard'."
+            )
+
         self.render_mode = render_mode
+        self.difficulty = difficulty
+
         self.width = 900
         self.height = 500
         self.ground_y = 390
@@ -19,20 +28,10 @@ class TerrainEnv(gym.Env):
 
         self.gravity = 0.7
         self.jump_strength = -12.0
-        self.max_speed = 4.0
+        self.max_speed = 7.0
 
         self.start_x = 100.0
         self.goal_x = 2400.0
-
-        # Each pair represents (gap start, gap width).
-        self.gaps = [
-            (420, 70),
-            (700, 100),
-            (1030, 80),
-            (1350, 120),
-            (1690, 90),
-            (2010, 110),
-        ]
 
         self.action_space = spaces.Discrete(3)
 
@@ -49,12 +48,13 @@ class TerrainEnv(gym.Env):
         self.clock = None
         self.camera_x = 0.0
 
+        self.gaps = []
         self.reset()
 
     def _is_over_gap(self, x):
         return any(
-            gap_start <= x < gap_start + gap_width
-            for gap_start, gap_width in self.gaps
+            start <= x < start + width
+            for start, width in self.gaps
         )
 
     def _get_obs(self):
@@ -75,13 +75,16 @@ class TerrainEnv(gym.Env):
             and self.vy == 0
         )
 
-        features = np.array(
+        return np.array(
             [
                 min(distance / 500, 1.0),
                 min(gap_width / 150, 1.0),
                 np.clip(
-                    (self.ground_y - self.player_size - self.player_y)
-                    / 150,
+                    (
+                        self.ground_y
+                        - self.player_size
+                        - self.player_y
+                    ) / 150,
                     0,
                     1,
                 ),
@@ -98,19 +101,29 @@ class TerrainEnv(gym.Env):
             dtype=np.float32,
         )
 
-        return features
-
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
+        self.gaps = generate_terrain(
+            difficulty=self.difficulty,
+            seed=seed,
+            start_x=int(self.start_x),
+            goal_x=int(self.goal_x),
+        )
+
         self.player_x = self.start_x
-        self.player_y = float(self.ground_y - self.player_size)
+        self.player_y = float(
+            self.ground_y - self.player_size
+        )
         self.vy = 0.0
         self.speed = self.max_speed
         self.camera_x = 0.0
         self.done = False
 
-        return self._get_obs(), {}
+        return self._get_obs(), {
+            "difficulty": self.difficulty,
+            "gap_count": len(self.gaps),
+        }
 
     def step(self, action):
         if self.done:
@@ -127,7 +140,10 @@ class TerrainEnv(gym.Env):
             self.speed = max(1.0, self.speed - 0.5)
 
         elif action == 1:
-            self.speed = min(self.max_speed, self.speed + 0.25)
+            self.speed = min(
+                self.max_speed,
+                self.speed + 0.25,
+            )
 
         elif action == 2:
             if (
@@ -138,18 +154,18 @@ class TerrainEnv(gym.Env):
             ):
                 self.vy = self.jump_strength
 
-            self.speed = min(self.max_speed, self.speed + 0.1)
+            self.speed = min(
+                self.max_speed,
+                self.speed + 0.1,
+            )
 
         previous_x = self.player_x
         self.player_x += self.speed
-
         reward += (self.player_x - previous_x) * 0.01
 
-        # Update vertical physics.
         self.vy += self.gravity
         self.player_y += self.vy
 
-        # Land only when the player is above solid ground.
         center_x = self.player_x + self.player_size / 2
         over_gap = self._is_over_gap(center_x)
 
@@ -163,7 +179,6 @@ class TerrainEnv(gym.Env):
             )
             self.vy = 0.0
 
-        # Falling below the screen means failure.
         if self.player_y > self.height:
             self.done = True
             return self._get_obs(), -100.0, True, False, {
@@ -200,35 +215,37 @@ class TerrainEnv(gym.Env):
                 return
 
         self.camera_x = max(
-            0, self.player_x - self.width * 0.3
+            0,
+            self.player_x - self.width * 0.3,
         )
 
         self.window.fill((18, 25, 45))
 
-        # Draw the ground in segments, leaving actual gaps.
         previous_end = 0
 
         for gap_start, gap_width in self.gaps:
-            screen_start = int(previous_end - self.camera_x)
-            screen_end = int(gap_start - self.camera_x)
-
             pygame.draw.rect(
                 self.window,
                 (65, 80, 100),
                 (
-                    screen_start,
+                    int(previous_end - self.camera_x),
                     self.ground_y,
-                    screen_end - screen_start,
+                    int(gap_start - previous_end),
                     self.height - self.ground_y,
                 ),
             )
 
-            # Mark the edges of the gap.
-            for edge_x in (gap_start, gap_start + gap_width):
+            for edge_x in (
+                gap_start,
+                gap_start + gap_width,
+            ):
                 pygame.draw.line(
                     self.window,
                     (220, 75, 75),
-                    (int(edge_x - self.camera_x), self.ground_y),
+                    (
+                        int(edge_x - self.camera_x),
+                        self.ground_y,
+                    ),
                     (
                         int(edge_x - self.camera_x),
                         self.ground_y + 18,
@@ -249,7 +266,6 @@ class TerrainEnv(gym.Env):
             ),
         )
 
-        # Draw the player.
         pygame.draw.rect(
             self.window,
             (70, 210, 230),
@@ -262,7 +278,6 @@ class TerrainEnv(gym.Env):
             border_radius=6,
         )
 
-        # Draw the finish line.
         pygame.draw.line(
             self.window,
             (90, 230, 130),
@@ -279,7 +294,7 @@ class TerrainEnv(gym.Env):
 
         font = pygame.font.Font(None, 28)
         label = font.render(
-            "VOIDRUNNER - Terrain Test",
+            f"VOIDRUNNER - {self.difficulty.upper()} TERRAIN",
             True,
             (255, 255, 255),
         )
