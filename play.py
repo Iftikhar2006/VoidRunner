@@ -25,14 +25,17 @@ def main():
     episode_finished = False
 
     print("\n========== VOIDRUNNER ==========")
-    print("RIGHT ARROW : Run forward")
-    print("LEFT ARROW  : Brake")
-    print("SPACE       : Jump")
-    print("R           : Restart level")
-    print("1           : Easy terrain")
-    print("2           : Medium terrain")
-    print("3           : Hard terrain")
-    print("ESC         : Quit")
+    print("RIGHT ARROW       : Move forward")
+    print("LEFT ARROW        : Move backward")
+    print("SPACE             : Jump vertically")
+    print("LEFT + SPACE      : Jump backward")
+    print("RIGHT + SPACE     : Jump forward")
+    print("No key            : Stop horizontally")
+    print("R                 : Restart level")
+    print("1                 : Easy terrain")
+    print("2                 : Medium terrain")
+    print("3                 : Hard terrain")
+    print("ESC               : Quit")
     print("================================\n")
 
     try:
@@ -87,12 +90,16 @@ def main():
             if episode_finished:
                 continue
 
-            if keys[pygame.K_SPACE]:
+            if keys[pygame.K_SPACE] and keys[pygame.K_LEFT]:
+                action = 4
+            elif keys[pygame.K_SPACE] and keys[pygame.K_RIGHT]:
+                action = 5
+            elif keys[pygame.K_SPACE]:
                 action = 2
-            elif keys[pygame.K_LEFT]:
-                action = 0
             elif keys[pygame.K_RIGHT]:
                 action = 1
+            elif keys[pygame.K_LEFT]:
+                action = 3
             else:
                 action = 0
 

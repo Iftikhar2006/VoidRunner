@@ -33,11 +33,11 @@ class TerrainEnv(gym.Env):
         self.start_x = 100.0
         self.goal_x = 2400.0
 
-        self.action_space = spaces.Discrete(3)
+        self.action_space = spaces.Discrete(6)
 
         self.observation_space = spaces.Box(
             low=np.array(
-                [0, 0, 0, -1, 0, 0, 0, 0],
+                [0, 0, 0, -1, 0, -1, 0, 0],
                 dtype=np.float32,
             ),
             high=np.ones(8, dtype=np.float32),
@@ -57,6 +57,22 @@ class TerrainEnv(gym.Env):
             for start, width in self.gaps
         )
 
+    def _player_over_gap(self):
+        player_center = self.player_x + self.player_size / 2
+        return self._is_over_gap(player_center)
+
+    def _path_over_gap(self, old_x, new_x):
+        left = min(old_x, new_x)
+        right = max(
+            old_x + self.player_size,
+            new_x + self.player_size,
+        )
+
+        return any(
+            left < start + width and right > start
+            for start, width in self.gaps
+        )
+
     def _get_obs(self):
         next_gap = next(
             (
@@ -73,6 +89,7 @@ class TerrainEnv(gym.Env):
         grounded = (
             self.player_y >= self.ground_y - self.player_size
             and self.vy == 0
+            and not self._player_over_gap()
         )
 
         return np.array(
@@ -90,7 +107,7 @@ class TerrainEnv(gym.Env):
                 ),
                 np.clip(self.vy / 15, -1, 1),
                 float(grounded),
-                np.clip(self.speed / self.max_speed, 0, 1),
+                np.clip(self.speed / self.max_speed, -1, 1),
                 np.clip(
                     (self.goal_x - self.player_x) / self.goal_x,
                     0,
@@ -116,7 +133,7 @@ class TerrainEnv(gym.Env):
             self.ground_y - self.player_size
         )
         self.vy = 0.0
-        self.speed = self.max_speed
+        self.speed = 0.0
         self.camera_x = 0.0
         self.done = False
 
@@ -132,46 +149,60 @@ class TerrainEnv(gym.Env):
             )
 
         if not self.action_space.contains(action):
-            raise ValueError("Action must be 0, 1, or 2.")
-
-        reward = -0.01
-
-        if action == 0:
-            self.speed = max(1.0, self.speed - 0.5)
-
-        elif action == 1:
-            self.speed = min(
-                self.max_speed,
-                self.speed + 0.25,
-            )
-
-        elif action == 2:
-            if (
-                self.player_y >= self.ground_y - self.player_size
-                and not self._is_over_gap(
-                    self.player_x + self.player_size / 2
-                )
-            ):
-                self.vy = self.jump_strength
-
-            self.speed = min(
-                self.max_speed,
-                self.speed + 0.1,
-            )
+            raise ValueError("Action must be between 0 and 5.")
 
         previous_x = self.player_x
+        previous_bottom = self.player_y + self.player_size
+
+        grounded = (
+            self.player_y >= self.ground_y - self.player_size
+            and self.vy == 0
+            and not self._player_over_gap()
+        )
+
+        if action == 0:
+            self.speed = 0.0
+
+        elif action == 1:
+            self.speed = self.max_speed
+
+        elif action == 2:
+            if grounded:
+                self.vy = self.jump_strength
+
+            self.speed = 0.0
+
+        elif action == 3:
+            self.speed = -self.max_speed
+
+        elif action == 4:
+            if grounded:
+                self.vy = self.jump_strength
+
+            self.speed = -self.max_speed
+
+        elif action == 5:
+            if grounded:
+                self.vy = self.jump_strength
+
+            self.speed = self.max_speed
+
         self.player_x += self.speed
+
+        reward = -0.01
         reward += (self.player_x - previous_x) * 0.01
 
         self.vy += self.gravity
         self.player_y += self.vy
 
-        center_x = self.player_x + self.player_size / 2
-        over_gap = self._is_over_gap(center_x)
+        current_bottom = self.player_y + self.player_size
+
+        over_gap = self._player_over_gap()
 
         if (
             self.vy >= 0
-            and self.player_y + self.player_size >= self.ground_y
+            and previous_bottom <= self.ground_y
+            and current_bottom >= self.ground_y
             and not over_gap
         ):
             self.player_y = float(
