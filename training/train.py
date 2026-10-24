@@ -373,4 +373,3 @@ if __name__ == "__main__":
         resume=args.resume,
         render=args.render,
     )
-Add this in that file
