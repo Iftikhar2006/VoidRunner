@@ -37,7 +37,7 @@ class TerrainEnv(gym.Env):
 
         self.observation_space = spaces.Box(
             low=np.array(
-                [0, 0, 0, -1, 0, -1, 0, 0],
+                [-1, 0, 0, -1, 0, -1, 0, 0],
                 dtype=np.float32,
             ),
             high=np.ones(8, dtype=np.float32),
@@ -84,7 +84,8 @@ class TerrainEnv(gym.Env):
         )
 
         gap_start, gap_width = next_gap
-        distance = max(0.0, gap_start - self.player_x)
+
+        signed_distance = gap_start - self.player_x
 
         grounded = (
             self.player_y >= self.ground_y - self.player_size
@@ -94,7 +95,7 @@ class TerrainEnv(gym.Env):
 
         return np.array(
             [
-                min(distance / 500, 1.0),
+                np.clip(signed_distance / 500, -1.0, 1.0),
                 min(gap_width / 150, 1.0),
                 np.clip(
                     (
@@ -152,6 +153,7 @@ class TerrainEnv(gym.Env):
             raise ValueError("Action must be between 0 and 5.")
 
         previous_x = self.player_x
+        previous_center = previous_x + self.player_size / 2
         previous_bottom = self.player_y + self.player_size
 
         grounded = (
@@ -196,8 +198,16 @@ class TerrainEnv(gym.Env):
         self.player_y += self.vy
 
         current_bottom = self.player_y + self.player_size
-
+        current_center = self.player_x + self.player_size / 2
         over_gap = self._player_over_gap()
+
+        cleared_gap = any(
+            previous_center < start + width <= current_center
+            for start, width in self.gaps
+        )
+
+        if cleared_gap and current_bottom < self.ground_y:
+            reward += 5.0
 
         if (
             self.vy >= 0
@@ -226,6 +236,7 @@ class TerrainEnv(gym.Env):
 
         return self._get_obs(), reward, False, False, {
             "success": False,
+            "gap_cleared": cleared_gap,
         }
 
     def render(self):
@@ -244,6 +255,9 @@ class TerrainEnv(gym.Env):
             if event.type == pygame.QUIT:
                 self.close()
                 return
+
+        if self.window is None:
+            return
 
         self.camera_x = max(
             0,

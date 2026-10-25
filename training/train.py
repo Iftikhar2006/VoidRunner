@@ -39,16 +39,22 @@ def select_action(model, state, epsilon, device):
 
 
 def save_checkpoint(path, episode, model, optimizer, total_steps):
-    torch.save(
-        {
-            "episode": episode,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "total_steps": total_steps,
-        },
-        path,
-    )
+    checkpoint = {
+        "episode": episode,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "total_steps": total_steps,
+    }
 
+    torch.save(checkpoint, path)
+
+    if episode % 250 == 0:
+        archive_dir = Path("checkpoints") / "archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+
+        archive_path = archive_dir / f"voidrunner_ep{episode}.pt"
+        torch.save(checkpoint, archive_path)
+        print(f"Archived checkpoint: {archive_path}")
 
 def train_dqn(
     episodes=500,
