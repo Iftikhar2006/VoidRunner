@@ -1,13 +1,14 @@
 """VoidRunner's side-view robot traversal environment.
 
-Phase 2 implementation for the existing VoidRunner project.
+Side-view robot traversal environment for the VoidRunner project.
 
-Actions (Discrete(5)):
+Actions (Discrete(6)):
     0 = brake
-    1 = walk
-    2 = sprint
+    1 = walk forward
+    2 = sprint forward
     3 = hop
     4 = leap
+    5 = reverse / move backward
 
 Observation (Box, shape=(18,)) is documented in OBSERVATION_FEATURES below.
 
@@ -34,7 +35,7 @@ from environment.terrain_generator import (
 )
 
 
-ENVIRONMENT_VERSION = "voidrunner_env_v2"
+ENVIRONMENT_VERSION = "voidrunner_env_v6_deadline_failure"
 
 ACTION_NAMES = {
     0: "brake",
@@ -42,11 +43,12 @@ ACTION_NAMES = {
     2: "sprint",
     3: "hop",
     4: "leap",
+    5: "reverse",
 }
 
 # Keep this ordered list synchronized with _get_observation().
 OBSERVATION_FEATURES = (
-    "horizontal_speed_fraction",
+    "horizontal_speed_fraction",  # signed [-1, 1]; negative means reversing
     "vertical_velocity_fraction",  # signed; in [-1, 1]
     "grounded",
     "remaining_energy_fraction",
@@ -82,7 +84,9 @@ class TerrainEnv(gym.Env):
         World-space x coordinates, in pixels. The robot starts at start_x and
         succeeds when its right edge reaches goal_x.
     max_steps:
-        Maximum physics frames per episode. Reaching it truncates the episode.
+        Mission deadline in physics frames. If the goal is not reached by this
+        deadline, the mission terminates as a failure. This is task termination,
+        not an external time-limit truncation.
     initial_energy:
         Battery budget in abstract energy units. It is normalized in the
         observation but the raw value is reported in info.
@@ -98,6 +102,7 @@ class TerrainEnv(gym.Env):
     SPRINT = 2
     HOP = 3
     LEAP = 4
+    REVERSE = 5
 
     SCREEN_WIDTH = 900
     SCREEN_HEIGHT = 500
@@ -106,6 +111,7 @@ class TerrainEnv(gym.Env):
     PLAYER_HEIGHT = 36
 
     MAX_SPEED = 7.0
+    MAX_REVERSE_SPEED = 2.4
     MAX_VERTICAL_SPEED = 16.0
     MAX_GAP_WIDTH = 100.0
     MAX_ROCK_WIDTH = 60.0
@@ -119,9 +125,11 @@ class TerrainEnv(gym.Env):
     WALK_SPEED = 3.2
     SPRINT_SPEED = 7.0
     HORIZONTAL_ACCELERATION = 0.30
+    REVERSE_ACCELERATION = 0.38
     BRAKE_DECELERATION = 0.65
     AIR_DRAG = 0.015
     AIR_ACCELERATION = 0.08
+    AIR_REVERSE_ACCELERATION = 0.045
 
     # Surface effects intentionally affect both movement and energy use.
     SURFACE_SPEED_MULTIPLIER = {
@@ -144,20 +152,21 @@ class TerrainEnv(gym.Env):
         SPRINT: 0.105,
         HOP: 0.025,
         LEAP: 0.030,
+        REVERSE: 0.040,
     }
     HOP_LAUNCH_ENERGY = 2.5
     LEAP_LAUNCH_ENERGY = 5.5
 
     PROGRESS_REWARD_WEIGHT = 1.0
-    ENERGY_PENALTY_WEIGHT = 0.5
-    STEP_PENALTY = 0.001
+    ENERGY_PENALTY_WEIGHT = 1.0
+    STEP_PENALTY = 0.0003
     HAZARD_CONTACT_PENALTY = 0.001
     GOAL_REWARD = 5.0
     FAILURE_PENALTY = -5.0
 
     # Actual obstacle sizes are smaller than this observation normalization cap.
     _OBS_LOW = np.asarray(
-        [0.0, -1.0, 0.0, 0.0, 0.0] + [0.0] * 13,
+        [-1.0, -1.0, 0.0, 0.0, 0.0] + [0.0] * 13,
         dtype=np.float32,
     )
     _OBS_HIGH = np.ones(18, dtype=np.float32)
@@ -195,7 +204,7 @@ class TerrainEnv(gym.Env):
         self.initial_energy = float(initial_energy)
         self.sensor_range = float(sensor_range)
 
-        self.action_space = spaces.Discrete(5)
+        self.action_space = spaces.Discrete(6)
         self.observation_space = spaces.Box(
             low=self._OBS_LOW.copy(),
             high=self._OBS_HIGH.copy(),
@@ -226,6 +235,10 @@ class TerrainEnv(gym.Env):
         self._clock = None
         self._font = None
         self._small_font = None
+        # Manual-mode UI state is presentation-only; it never affects physics.
+        self.manual_mode = False
+        self.manual_last_action = "ready"
+        self.manual_last_energy_cost = 0.0
 
     # ------------------------------------------------------------------
     # Gymnasium API
@@ -315,6 +328,9 @@ class TerrainEnv(gym.Env):
         self.success = False
         self.failure_reason = None
         self._episode_done = False
+        self.manual_last_action = "ready"
+        self.manual_last_energy_cost = 0.0
+        self._last_action_name = "ready"
 
         observation = self._get_observation()
         info = {
@@ -338,7 +354,7 @@ class TerrainEnv(gym.Env):
         if self._episode_done:
             raise RuntimeError("Episode has ended. Call reset() before calling step() again.")
         if not self.action_space.contains(action):
-            raise ValueError(f"Invalid action {action!r}; expected an integer in [0, 4]")
+            raise ValueError(f"Invalid action {action!r}; expected an integer in [0, 5]")
 
         action = int(action)
         self._last_action_name = ACTION_NAMES[action]
@@ -385,10 +401,11 @@ class TerrainEnv(gym.Env):
         self.energy = max(0.0, self.energy - energy_spent)
         self.total_energy_consumed += energy_spent
 
-        # Advance x and vertical physics. Speed is always non-negative; the
-        # robot's intended route is forward, not left-right platforming.
+        # Advance horizontal and vertical physics. Horizontal speed is signed:
+        # positive moves toward the goal and negative speed allows repositioning.
         self.x += self.speed
-        self.x = min(self.x, float(self.goal_x))
+        # Allow backing up to the start line, but never beyond the course boundary.
+        self.x = max(float(self.start_x), min(self.x, float(self.goal_x)))
 
         if self.grounded:
             # If the centre leaves solid ground, the robot begins falling.
@@ -447,11 +464,18 @@ class TerrainEnv(gym.Env):
             terminated = True
             terminal_reward = self.FAILURE_PENALTY
         elif self.steps >= self.max_steps:
+            # The time budget is part of the mission objective. Failing to reach
+            # the destination by the deadline is a terminal mission failure,
+            # with the same penalty as other failures. This prevents a policy
+            # from preferring to stall until an unpenalized truncation.
             self.failure_reason = "time_limit"
-            truncated = True
+            terminated = True
+            terminal_reward = self.FAILURE_PENALTY
 
         new_progress = self._progress_fraction()
-        progress_fraction_delta = max(0.0, new_progress - previous_progress)
+        # Retreating reduces route progress. This gives reverse a real cost while
+        # still allowing the agent to back up when a better approach is needed.
+        progress_fraction_delta = new_progress - previous_progress
         progress_reward = self.PROGRESS_REWARD_WEIGHT * progress_fraction_delta
         energy_penalty = -self.ENERGY_PENALTY_WEIGHT * (energy_spent / self.initial_energy)
         step_penalty = -self.STEP_PENALTY
@@ -484,6 +508,7 @@ class TerrainEnv(gym.Env):
             "x": float(self.x),
             "y": float(self.y),
             "speed": float(self.speed),
+            "horizontal_direction": "forward" if self.speed > 0.05 else "backward" if self.speed < -0.05 else "stationary",
             "vertical_velocity": float(self.vy),
             "grounded": bool(self.grounded),
             "surface": self._surface_at(self.x + self.PLAYER_WIDTH / 2.0),
@@ -583,7 +608,7 @@ class TerrainEnv(gym.Env):
         second_type = second["type"] if second else None
         observation = np.asarray(
             [
-                np.clip(self.speed / self.MAX_SPEED, 0.0, 1.0),
+                np.clip(self.speed / self.MAX_SPEED, -1.0, 1.0),
                 np.clip(self.vy / self.MAX_VERTICAL_SPEED, -1.0, 1.0),
                 1.0 if self.grounded else 0.0,
                 np.clip(self.energy / self.initial_energy, 0.0, 1.0),
@@ -609,6 +634,15 @@ class TerrainEnv(gym.Env):
             raise RuntimeError("Environment produced a non-finite observation")
         return np.clip(observation, self._OBS_LOW, self._OBS_HIGH).astype(np.float32)
 
+    @staticmethod
+    def _move_towards(current: float, target: float, max_delta: float) -> float:
+        """Move a signed velocity toward a target without overshooting it."""
+        if current < target:
+            return min(target, current + max_delta)
+        if current > target:
+            return max(target, current - max_delta)
+        return current
+
     def _apply_horizontal_action(
         self,
         action: int,
@@ -616,21 +650,25 @@ class TerrainEnv(gym.Env):
         was_grounded: bool,
         launched_jump: bool,
     ) -> None:
-        # Jump buttons initiate vertical motion only. They preserve current
-        # momentum for the launch frame; they are not magic forward teleports.
+        # Jump buttons change vertical velocity only at takeoff. In the air they
+        # preserve horizontal momentum apart from tiny drag.
         if action in (self.HOP, self.LEAP):
             if not was_grounded:
-                # An airborne jump command cannot relaunch the robot.
-                self.speed = max(0.0, self.speed - self.AIR_DRAG)
+                self.speed = self._move_towards(self.speed, 0.0, self.AIR_DRAG)
             return
 
         if not was_grounded:
-            # Air control is deliberately weaker than ground acceleration, so
-            # takeoff speed and the timing of the maneuver remain important.
             if action == self.BRAKE:
-                self.speed = max(0.0, self.speed - 0.22)
+                self.speed = self._move_towards(self.speed, 0.0, 0.22)
+                return
+            if action == self.REVERSE:
+                target_speed = -self.MAX_REVERSE_SPEED
+                self.speed = self._move_towards(
+                    self.speed, target_speed, self.AIR_REVERSE_ACCELERATION
+                )
                 return
             target_speed = self.WALK_SPEED if action == self.WALK else self.SPRINT_SPEED
+            target_speed *= mobility if action == self.WALK else 1.0
             if self.speed < target_speed:
                 self.speed = min(target_speed, self.speed + self.AIR_ACCELERATION)
             elif self.speed > target_speed:
@@ -638,17 +676,23 @@ class TerrainEnv(gym.Env):
             return
 
         if action == self.BRAKE:
-            self.speed = max(0.0, self.speed - self.BRAKE_DECELERATION * max(0.7, mobility))
+            deceleration = self.BRAKE_DECELERATION * max(0.7, mobility)
+            self.speed = self._move_towards(self.speed, 0.0, deceleration)
+            return
+
+        if action == self.REVERSE:
+            target_speed = -self.MAX_REVERSE_SPEED * mobility
+            acceleration = self.REVERSE_ACCELERATION * max(0.45, mobility)
+            self.speed = self._move_towards(self.speed, target_speed, acceleration)
             return
 
         target_speed = self.WALK_SPEED if action == self.WALK else self.SPRINT_SPEED
         target_speed *= mobility
         acceleration = self.HORIZONTAL_ACCELERATION * max(0.45, mobility)
-        if self.speed < target_speed:
-            self.speed = min(target_speed, self.speed + acceleration)
-        elif self.speed > target_speed:
-            # Releasing sprint naturally settles speed rather than changing it instantly.
-            self.speed = max(target_speed, self.speed - acceleration * 0.75)
+        self.speed = self._move_towards(
+            self.speed, target_speed, acceleration if self.speed <= target_speed
+            else acceleration * 0.75
+        )
 
     def _colliding_rock(self) -> tuple[int, int, int] | None:
         player_left = self.x
@@ -746,6 +790,8 @@ class TerrainEnv(gym.Env):
                     )
             pygame.draw.line(screen, (220, 75, 67), (sx, ground_y), (sx, ground_y - 7), 3)
             pygame.draw.line(screen, (220, 75, 67), (ex, ground_y), (ex, ground_y - 7), 3)
+            if ex >= 0 and sx <= screen_w:
+                self._draw_text(f"GAP {gw}px", (max(3, sx + 2), ground_y - 22), (170, 49, 45), small=True)
 
         # Surface patches have both visible textures and real movement/energy effects.
         terrain_colors = {
@@ -770,6 +816,9 @@ class TerrainEnv(gym.Env):
             else:
                 for tx in range(max(0, sx - 10), min(screen_w, ex), 16):
                     pygame.draw.line(screen, accent, (tx, ground_y + 8), (tx + 8, ground_y + 22), 3)
+            if ex - sx >= 45:
+                tag_colors = {"rubble": (255, 242, 218), "mud": (234, 247, 255), "hazard": (255, 236, 220)}
+                self._draw_text(kind.upper(), (max(2, sx + 3), ground_y + 27), tag_colors[kind], small=True)
 
         # Rocks: a collision-relevant object, not merely decoration.
         for rx, rw, rh in self.rocks:
@@ -784,6 +833,7 @@ class TerrainEnv(gym.Env):
             ]
             pygame.draw.polygon(screen, (92, 88, 84), rock_points)
             pygame.draw.lines(screen, (135, 130, 122), False, rock_points[1:-1], 2)
+            self._draw_text(f"ROCK {rh}px", (max(2, sx - 1), max(180, top - 17)), (48, 55, 60), small=True)
 
         # Goal marker and finish banner.
         goal_screen_x = int(self.goal_x - camera_x)
@@ -808,8 +858,8 @@ class TerrainEnv(gym.Env):
         pygame.draw.circle(screen, (252, 236, 176), (robot_screen_x + 25, robot_top + 1), 1)
 
         # HUD panel.
-        pygame.draw.rect(screen, (22, 35, 49), (15, 14, 310, 104), border_radius=10)
-        pygame.draw.rect(screen, (70, 96, 114), (15, 14, 310, 104), 2, border_radius=10)
+        pygame.draw.rect(screen, (22, 35, 49), (15, 14, 390, 132), border_radius=10)
+        pygame.draw.rect(screen, (70, 96, 114), (15, 14, 390, 132), 2, border_radius=10)
         self._draw_text(f"VOIDRUNNER  |  {self.difficulty.upper()}", (27, 22), (245, 248, 249))
         action_name = getattr(self, "_last_action_name", "ready")
         self._draw_text(f"Mode: {action_name}    Speed: {self.speed:4.1f}", (27, 43), (220, 231, 235), small=True)
@@ -824,8 +874,53 @@ class TerrainEnv(gym.Env):
         pygame.draw.rect(screen, (65, 74, 84), (27, 91, 274, 8), border_radius=4)
         pygame.draw.rect(screen, (57, 177, 105), (27, 91, int(274 * progress), 8), border_radius=4)
         self._draw_text(f"Progress {progress * 100:5.1f}%   Step {self.steps}/{self.max_steps}", (27, 101), (220, 231, 235), small=True)
+        if self.manual_mode:
+            self._draw_text(
+                f"INPUT {self.manual_last_action.upper()}   ENERGY USED {self.manual_last_energy_cost:.3f}",
+                (27, 123), (220, 231, 235), small=True,
+            )
 
-        # State / result text and simple controls legend.
+        # Tactical preview: show the local sensor information that should drive
+        # a decision, not an automatic instruction telling the player what to do.
+        panel_x, panel_y, panel_w, panel_h = screen_w - 360, 55, 345, 117
+        pygame.draw.rect(screen, (22, 35, 49), (panel_x, panel_y, panel_w, panel_h), border_radius=9)
+        pygame.draw.rect(screen, (70, 96, 114), (panel_x, panel_y, panel_w, panel_h), 2, border_radius=9)
+        self._draw_text("LOCAL TERRAIN SENSORS", (panel_x + 10, panel_y + 7), (248, 211, 111), small=True)
+        upcoming = self._upcoming_obstacles()
+        first = upcoming[0] if upcoming else None
+        second = upcoming[1] if len(upcoming) > 1 else None
+        current_surface = self._surface_at(self.x + self.PLAYER_WIDTH / 2.0)
+        distance1 = max(0.0, first["x"] - (self.x + self.PLAYER_WIDTH)) if first else None
+        if first:
+            if first["type"] == "gap":
+                first_label = f"NEXT: GAP {first['width']:.0f}px | edge in {distance1:.0f}px"
+            else:
+                first_label = f"NEXT: ROCK {first['width']:.0f}x{first['height']:.0f}px | {distance1:.0f}px"
+        else:
+            first_label = "NEXT: clear route to goal"
+        self._draw_text(first_label, (panel_x + 10, panel_y + 29), (244, 248, 250), small=True)
+        if first and second:
+            clearance = max(0.0, second["x"] - first["end"])
+            self._draw_text(
+                f"AFTER: {second['type'].upper()}   | landing/runway {clearance:.0f}px",
+                (panel_x + 10, panel_y + 49), (220, 231, 235), small=True,
+            )
+        elif first:
+            self._draw_text("AFTER: no second hazard in route", (panel_x + 10, panel_y + 49), (220, 231, 235), small=True)
+        else:
+            self._draw_text("AFTER: destination ahead", (panel_x + 10, panel_y + 49), (220, 231, 235), small=True)
+        self._draw_text(
+            f"GROUND: {current_surface.upper()}  | speed {self.speed:+.1f} px/frame",
+            (panel_x + 10, panel_y + 69), (220, 231, 235), small=True,
+        )
+        speed_mult = self.SURFACE_SPEED_MULTIPLIER[current_surface]
+        energy_mult = self.SURFACE_ENERGY_MULTIPLIER[current_surface]
+        self._draw_text(
+            f"surface traction x{speed_mult:.2f}  | energy cost x{energy_mult:.2f}",
+            (panel_x + 10, panel_y + 89), (220, 231, 235), small=True,
+        )
+
+        # State / result text.
         if self.success:
             status_text = "MISSION COMPLETE"
             status_color = (38, 126, 78)
@@ -837,8 +932,22 @@ class TerrainEnv(gym.Env):
             status_color = (22, 35, 49)
         pygame.draw.rect(screen, status_color, (screen_w - 330, 14, 315, 32), border_radius=7)
         self._draw_text(status_text, (screen_w - 320, 22), (250, 250, 250), small=True)
-        pygame.draw.rect(screen, (22, 35, 49), (15, screen_h - 30, 440, 20), border_radius=6)
-        self._draw_text("0 Brake   1 Walk   2 Sprint   3 Hop   4 Leap", (24, screen_h - 27), (245, 248, 249), small=True)
+        footer_y = screen_h - 61
+        pygame.draw.rect(screen, (22, 35, 49), (12, footer_y, screen_w - 24, 54), border_radius=8)
+        if self.manual_mode:
+            self._draw_text(
+                "BACK: A / Left   |   BRAKE: S / 0   |   WALK: W / Right   |   SPRINT: D / 2",
+                (22, footer_y + 7), (245, 248, 249), small=True,
+            )
+            self._draw_text(
+                "HOP: Space / 3   |   LEAP: Shift / 4   |   R retry   |   N new course   |   Esc quit",
+                (22, footer_y + 29), (245, 248, 249), small=True,
+            )
+        else:
+            self._draw_text(
+                "Actions: 0 Brake   1 Walk   2 Sprint   3 Hop   4 Leap   5 Reverse",
+                (22, footer_y + 17), (245, 248, 249), small=True,
+            )
 
         pygame.display.flip()
         if self._clock is not None:
